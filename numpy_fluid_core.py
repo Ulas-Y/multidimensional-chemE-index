@@ -1,3 +1,4 @@
+import math
 import warnings
 import numpy as _np
 
@@ -72,6 +73,59 @@ class _Backend:
         if self.name == "torch":
             return _torch_gradient(x, axis)
         return self.backend.gradient(x, axis=axis)
+
+
+def _to_python_float(x):
+    if hasattr(x, "item"):
+        return x.item()
+    return float(x)
+
+
+def _velocity_magnitude_squared(velocity):
+    arr = xp.asarray(velocity, dtype=float)
+    return _to_python_float((arr * arr).sum())
+
+
+def omega_n_minus_1(n):
+    if n <= 0:
+        raise ValueError("n must be a positive integer")
+    return 2.0 * math.pi ** (n / 2.0) / math.gamma(n / 2.0)
+
+
+def event_horizon_radius(M, n, G_D=6.67430e-11, c=299792458.0):
+    if n < 3:
+        raise ValueError("Spatial dimension n must be at least 3")
+    return ((16.0 * math.pi * G_D * M) / ((n - 1.0) * omega_n_minus_1(n - 1) * c ** 2)) ** (1.0 / (n - 2.0))
+
+
+def gravitational_time_dilation(delta_t0, M, r, n, G_D=6.67430e-11, c=299792458.0):
+    if n < 3:
+        raise ValueError("Spatial dimension n must be at least 3")
+    if r <= 0:
+        raise ValueError("Radius r must be positive")
+
+    factor = (16.0 * math.pi * G_D * M) / ((n - 1.0) * omega_n_minus_1(n - 1) * c ** 2 * r ** (n - 2.0))
+    if factor >= 1.0:
+        r_s = event_horizon_radius(M, n, G_D=G_D, c=c)
+        raise ValueError(
+            f"Inside or on the event horizon: r <= r_s ({r_s})." \
+            f" Computed factor={factor}"
+        )
+    return delta_t0 * math.sqrt(1.0 - factor)
+
+
+def special_time_dilation(delta_t0, velocity, c=299792458.0):
+    v2 = _velocity_magnitude_squared(velocity)
+    if v2 >= c ** 2:
+        raise ValueError("Velocity magnitude must be less than the speed of light")
+    return delta_t0 / math.sqrt(1.0 - v2 / (c ** 2))
+
+
+def relativistic_volume_contraction(V0, velocity, c=299792458.0):
+    v2 = _velocity_magnitude_squared(velocity)
+    if v2 >= c ** 2:
+        raise ValueError("Velocity magnitude must be less than the speed of light")
+    return V0 * math.sqrt(1.0 - v2 / (c ** 2))
 
 
 if _TORCH_AVAILABLE and torch.cuda.is_available():
