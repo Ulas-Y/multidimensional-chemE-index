@@ -516,7 +516,7 @@ class RelativisticStressEnergyTensor:
         """Compute T_00 component: energy density."""
         gamma_u = self.lorentz_factor_field()
         h = 1.0 + self.epsilon + self.p / (self.rho0 * self.c ** 2 + 1e-30)
-        return gamma_u ** 2 * self.rho0 * h + self.p
+        return (gamma_u ** 2) * self.rho0 * h - self.p
 
     def momentum_density(self):
         """Compute S^i = -T^0i: momentum density."""
@@ -574,8 +574,11 @@ class TimeIntegrator:
         self.c = c
         self.G_D = G_D
         self.projector = PressureProjector(geometry)
+        # EOS and stabilization defaults
+        self.Gamma_eos = 5.0 / 3.0
+        self.sigma_visc = 0.06
 
-    def compute_velocity_rhs(self, state):
+    def compute_velocity_rhs(self, state, gamma_field, h):
         """
         Compute RHS for velocity evolution:
         dv^i/dt = -(1/rho) g^ij ∂_j P  [pressure gradient]
@@ -583,27 +586,13 @@ class TimeIntegrator:
                   +(nu) ∇²v^i           [viscous diffusion]
         """
         state.update_derived_quantities(self.geometry)
-        
+
         dv_dt = xp.zeros_like(state.velocity)
         g_inv = self.geometry.metric_inverse(state.spatial_metric)
         metric = state.spatial_metric
         v = state.velocity
 
-        # Construct Eulerian 3-velocity U^i = (v^i + beta^i) / alpha
-        U = xp.zeros_like(v)
-        for i in range(self.n_dim):
-            U[..., i] = (v[..., i] + state.shift[..., i]) / (state.lapse + 1e-30)
-
-        # Compute Lorentz gamma field: gamma = 1/sqrt(1 - U^2/c^2)
-        U_sq = xp.zeros_like(U[..., 0])
-        for i in range(self.n_dim):
-            for j in range(self.n_dim):
-                U_sq = U_sq + state.spatial_metric[..., i, j] * U[..., i] * U[..., j]
-        gamma_field = 1.0 / ((1.0 - U_sq / (self.c ** 2)) ** 0.5 + 1e-30)
-
-        # Specific enthalpy h = 1 + epsilon + P/(rho0 c^2)
         rho0 = state.rest_density
-        h = 1.0 + state.internal_energy + state.pressure / (rho0 * self.c ** 2 + 1e-30)
 
         # Pressure gradient term: -(1/(rho0 * h * gamma^2)) g^ij ∂_j P
         for i in range(self.n_dim):
@@ -626,6 +615,108 @@ class TimeIntegrator:
                 dv_dt[..., i] = dv_dt[..., i] + nu * lap_vi
 
         return dv_dt
+
+    def update_pressure_from_eos(self, state):
+        """Update pressure in-place from EOS: P = (Gamma - 1) rho0 epsilon."""
+        Gamma = getattr(self, 'Gamma_eos', 5.0 / 3.0)
+        state.pressure = (Gamma - 1.0) * state.rest_density * state.internal_energy
+
+    def compute_lorentz_factor(self, state):
+        """Compute Eulerian Lorentz factor gamma from U^i = (v^i + beta^i) / alpha."""
+        U = xp.zeros_like(state.velocity)
+        for i in range(self.n_dim):
+            U[..., i] = (state.velocity[..., i] + state.shift[..., i]) / (state.lapse + 1e-30)
+
+        U_sq = xp.zeros_like(U[..., 0])
+        for i in range(self.n_dim):
+            for j in range(self.n_dim):
+                U_sq = U_sq + state.spatial_metric[..., i, j] * U[..., i] * U[..., j]
+
+        gamma = 1.0 / ((1.0 - U_sq / (self.c ** 2)) ** 0.5 + 1e-30)
+        return gamma, U
+
+    def compute_density_rhs(self, state, gamma_field):
+        """Compute RHS for rest-mass density: ∂_t ρ0 = -Σ_i v^i ∂_i ρ0 - ρ0 Θ"""
+        rho0 = state.rest_density
+        v = state.velocity
+
+        # Compute ln(gamma * sqrt(det g)) and its gradients
+        sqrt_g = self.geometry.sqrt_det_g(state.spatial_metric)
+        ln_factor = xp.log((gamma_field + 1e-30) * (sqrt_g + 1e-30) + 1e-30)
+
+        Theta = xp.zeros_like(rho0)
+        for i in range(self.n_dim):
+            dvii = self.geometry.gradient_with_width(v[..., i], i)
+            dln = self.geometry.gradient_with_width(ln_factor, i)
+            Theta = Theta + (dvii + v[..., i] * dln)
+
+        adv = xp.zeros_like(rho0)
+        for i in range(self.n_dim):
+            drho_di = self.geometry.gradient_with_width(rho0, i)
+            adv = adv + v[..., i] * drho_di
+
+        d_rho_dt = -adv - rho0 * Theta
+        return d_rho_dt
+
+    def compute_energy_rhs(self, state, gamma_field):
+        """Compute RHS for specific internal energy: ∂_t ε = -v·∇ε - (P/ρ0) Θ"""
+        eps = state.internal_energy
+        rho0 = state.rest_density
+        P = state.pressure
+        v = state.velocity
+
+        # Compute Theta as in density RHS
+        sqrt_g = self.geometry.sqrt_det_g(state.spatial_metric)
+        ln_factor = xp.log((gamma_field + 1e-30) * (sqrt_g + 1e-30) + 1e-30)
+
+        Theta = xp.zeros_like(eps)
+        for i in range(self.n_dim):
+            dvii = self.geometry.gradient_with_width(v[..., i], i)
+            dln = self.geometry.gradient_with_width(ln_factor, i)
+            Theta = Theta + (dvii + v[..., i] * dln)
+
+        adv = xp.zeros_like(eps)
+        for i in range(self.n_dim):
+            deps_di = self.geometry.gradient_with_width(eps, i)
+            adv = adv + v[..., i] * deps_di
+
+        d_eps_dt = -adv - (P / (rho0 + 1e-30)) * Theta
+        return d_eps_dt
+
+    def compute_artificial_dissipation(self, field):
+        """Compute simple Lax-Friedrichs type artificial dissipation for scalar or vector field."""
+        # sigma_visc * Σ_i (dx_i)^2 ∂^2 φ / ∂ x_i^2
+        sigma = getattr(self, 'sigma_visc', 0.06)
+        # second derivatives per axis
+        diss = xp.zeros_like(field)
+        for i in range(self.n_dim):
+            dx_i = float(self.geometry.cell_widths[i])
+            second = self.geometry.gradient_with_width(self.geometry.gradient_with_width(field, i), i)
+            diss = diss + (dx_i ** 2) * second
+        return sigma * diss
+
+    def compute_rhs(self, state):
+        """Compute complete RHS tuple for (metric, extrinsic, rho0, velocity, eps)."""
+        # 1. Update pressure from EOS before evaluating RHS
+        self.update_pressure_from_eos(state)
+
+        # 2. Compute Lorentz gamma and enthalpy
+        gamma_field, U = self.compute_lorentz_factor(state)
+        rho0 = state.rest_density
+        eps = state.internal_energy
+        P = state.pressure
+        h = 1.0 + eps / (self.c ** 2) + P / (rho0 * (self.c ** 2) + 1e-30)
+
+        # 3. Evaluate hydrodynamic RHS
+        d_rho_dt = self.compute_density_rhs(state, gamma_field) + self.compute_artificial_dissipation(state.rest_density)
+        d_eps_dt = self.compute_energy_rhs(state, gamma_field) + self.compute_artificial_dissipation(state.internal_energy)
+        d_v_dt = self.compute_velocity_rhs(state, gamma_field, h) + self.compute_artificial_dissipation(state.velocity)
+
+        # 4. Geometric RHS preserved
+        d_g_dt = self.compute_metric_rhs(state)
+        d_k_dt = self.compute_extrinsic_rhs(state)
+
+        return d_g_dt, d_k_dt, d_rho_dt, d_v_dt, d_eps_dt
 
     def compute_mass_rhs(self, state):
         """
@@ -738,11 +829,13 @@ class TimeIntegrator:
         new_state.coordinate_time = state.coordinate_time
         return new_state
 
-    def add_scaled_rhs(self, state, rhs_velocity, rhs_mass, rhs_metric, rhs_extrinsic, factor):
-        """Add scaled RHS to state: state += factor * rhs"""
+    def add_scaled_rhs(self, state, rhs_velocity, rhs_rest_density, rhs_metric, rhs_extrinsic, rhs_internal_energy, factor):
+        """Add scaled RHS to state: state += factor * rhs for full primitive set"""
         new_state = self.copy_state(state)
         new_state.velocity = state.velocity + factor * rhs_velocity
-        new_state.mass = state.mass + factor * rhs_mass
+        # evolve rest_density and internal energy
+        new_state.rest_density = state.rest_density + factor * rhs_rest_density
+        new_state.internal_energy = state.internal_energy + factor * rhs_internal_energy
         new_state.spatial_metric = state.spatial_metric + factor * rhs_metric
         new_state.extrinsic_curv = state.extrinsic_curv + factor * rhs_extrinsic
         return new_state
@@ -752,24 +845,20 @@ class ExplicitEulerIntegrator(TimeIntegrator):
     """Explicit Euler time integrator: x^{n+1} = x^n + dt * dx/dt"""
     def step(self, state, dt):
         """Advance state by dt using explicit Euler."""
-        # Compute RHS at current state
-        vel_rhs = self.compute_velocity_rhs(state)
-        mass_rhs = self.compute_mass_rhs(state)
-        metric_rhs = self.compute_metric_rhs(state)
-        extrinsic_rhs = self.compute_extrinsic_rhs(state)
+        # Compute RHS for full system
+        d_g_dt, d_k_dt, d_rho_dt, d_v_dt, d_eps_dt = self.compute_rhs(state)
 
-        # Update state
+        # Update state primitives
         state_new = self.copy_state(state)
-        state_new.velocity = state.velocity + dt * vel_rhs
-        state_new.mass = state.mass + dt * mass_rhs
-        state_new.spatial_metric = state.spatial_metric + dt * metric_rhs
-        state_new.extrinsic_curv = state.extrinsic_curv + dt * extrinsic_rhs
+        state_new.velocity = state.velocity + dt * d_v_dt
+        state_new.rest_density = state.rest_density + dt * d_rho_dt
+        state_new.internal_energy = state.internal_energy + dt * d_eps_dt
+        state_new.spatial_metric = state.spatial_metric + dt * d_g_dt
+        state_new.extrinsic_curv = state.extrinsic_curv + dt * d_k_dt
 
-        # Project velocity to enforce incompressibility
+        # Update derived quantities and pressure from EOS
         state_new.update_derived_quantities(self.geometry)
-        state_new.velocity, state_new.pressure = self.projector.project_velocity(
-            state_new.velocity, state_new.spatial_metric, dt, state_new.density
-        )
+        self.update_pressure_from_eos(state_new)
 
         # Update proper time
         state_new.update_proper_time(self.geometry, dt, self.c)
@@ -785,51 +874,37 @@ class RK4Integrator(TimeIntegrator):
     def step(self, state, dt):
         """Advance state by dt using RK4."""
         # Stage 1: k1 = f(t, x^n)
-        k1_vel = self.compute_velocity_rhs(state)
-        k1_mass = self.compute_mass_rhs(state)
-        k1_metric = self.compute_metric_rhs(state)
-        k1_extrinsic = self.compute_extrinsic_rhs(state)
+        k1_g, k1_k, k1_rho, k1_v, k1_eps = self.compute_rhs(state)
 
         # Stage 2: k2 = f(t + dt/2, x^n + (dt/2)*k1)
-        state_2 = self.add_scaled_rhs(state, k1_vel, k1_mass, k1_metric, k1_extrinsic, dt / 2.0)
+        state_2 = self.add_scaled_rhs(state, k1_v, k1_rho, k1_g, k1_k, k1_eps, dt / 2.0)
         state_2.update_derived_quantities(self.geometry)
-        k2_vel = self.compute_velocity_rhs(state_2)
-        k2_mass = self.compute_mass_rhs(state_2)
-        k2_metric = self.compute_metric_rhs(state_2)
-        k2_extrinsic = self.compute_extrinsic_rhs(state_2)
+        self.update_pressure_from_eos(state_2)
+        k2_g, k2_k, k2_rho, k2_v, k2_eps = self.compute_rhs(state_2)
 
         # Stage 3: k3 = f(t + dt/2, x^n + (dt/2)*k2)
-        state_3 = self.add_scaled_rhs(state, k2_vel, k2_mass, k2_metric, k2_extrinsic, dt / 2.0)
+        state_3 = self.add_scaled_rhs(state, k2_v, k2_rho, k2_g, k2_k, k2_eps, dt / 2.0)
         state_3.update_derived_quantities(self.geometry)
-        k3_vel = self.compute_velocity_rhs(state_3)
-        k3_mass = self.compute_mass_rhs(state_3)
-        k3_metric = self.compute_metric_rhs(state_3)
-        k3_extrinsic = self.compute_extrinsic_rhs(state_3)
+        self.update_pressure_from_eos(state_3)
+        k3_g, k3_k, k3_rho, k3_v, k3_eps = self.compute_rhs(state_3)
 
         # Stage 4: k4 = f(t + dt, x^n + dt*k3)
-        state_4 = self.add_scaled_rhs(state, k3_vel, k3_mass, k3_metric, k3_extrinsic, dt)
+        state_4 = self.add_scaled_rhs(state, k3_v, k3_rho, k3_g, k3_k, k3_eps, dt)
         state_4.update_derived_quantities(self.geometry)
-        k4_vel = self.compute_velocity_rhs(state_4)
-        k4_mass = self.compute_mass_rhs(state_4)
-        k4_metric = self.compute_metric_rhs(state_4)
-        k4_extrinsic = self.compute_extrinsic_rhs(state_4)
+        self.update_pressure_from_eos(state_4)
+        k4_g, k4_k, k4_rho, k4_v, k4_eps = self.compute_rhs(state_4)
 
         # Combine stages
         state_new = self.copy_state(state)
-        state_new.velocity = (state.velocity + 
-                             (dt / 6.0) * (k1_vel + 2.0*k2_vel + 2.0*k3_vel + k4_vel))
-        state_new.mass = (state.mass + 
-                         (dt / 6.0) * (k1_mass + 2.0*k2_mass + 2.0*k3_mass + k4_mass))
-        state_new.spatial_metric = (state.spatial_metric + 
-                                   (dt / 6.0) * (k1_metric + 2.0*k2_metric + 2.0*k3_metric + k4_metric))
-        state_new.extrinsic_curv = (state.extrinsic_curv + 
-                                   (dt / 6.0) * (k1_extrinsic + 2.0*k2_extrinsic + 2.0*k3_extrinsic + k4_extrinsic))
+        state_new.velocity = (state.velocity + (dt / 6.0) * (k1_v + 2.0*k2_v + 2.0*k3_v + k4_v))
+        state_new.rest_density = (state.rest_density + (dt / 6.0) * (k1_rho + 2.0*k2_rho + 2.0*k3_rho + k4_rho))
+        state_new.internal_energy = (state.internal_energy + (dt / 6.0) * (k1_eps + 2.0*k2_eps + 2.0*k3_eps + k4_eps))
+        state_new.spatial_metric = (state.spatial_metric + (dt / 6.0) * (k1_g + 2.0*k2_g + 2.0*k3_g + k4_g))
+        state_new.extrinsic_curv = (state.extrinsic_curv + (dt / 6.0) * (k1_k + 2.0*k2_k + 2.0*k3_k + k4_k))
 
-        # Project velocity to enforce incompressibility
+        # Update derived quantities and pressure from EOS
         state_new.update_derived_quantities(self.geometry)
-        state_new.velocity, state_new.pressure = self.projector.project_velocity(
-            state_new.velocity, state_new.spatial_metric, dt, state_new.density
-        )
+        self.update_pressure_from_eos(state_new)
 
         # Update proper time
         state_new.update_proper_time(self.geometry, dt, self.c)
