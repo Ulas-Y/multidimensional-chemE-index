@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Code Mini-Wiki</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        line-height: 1.6;
+        margin: 0;
+        padding: 0;
+        background: #f5f7fb;
+        color: #1f2937;
+      }
+      header {
+        background: #1e40af;
+        color: white;
+        padding: 1.5rem 1rem;
+        text-align: center;
+      }
+      main {
+        max-width: 900px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+      }
+      section {
+        background: white;
+        border-radius: 10px;
+        box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+        margin-bottom: 1.5rem;
+        padding: 1.5rem;
+      }
+      nav {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        margin-bottom: 1rem;
+      }
+      nav a {
+        color: #1e40af;
+        text-decoration: none;
+        font-weight: 600;
+      }
+      nav a:hover {
+        text-decoration: underline;
+      }
+      h1, h2 {
+        margin-top: 0;
+      }
+      code {
+        background: #eef2ff;
+        border-radius: 4px;
+        padding: 0.15rem 0.3rem;
+        font-family: Menlo, Monaco, Consolas, monospace;
+      }
+      .badge {
+        display: inline-block;
+        padding: 0.2rem 0.5rem;
+        background: #dbeafe;
+        border-radius: 999px;
+        font-size: 0.85rem;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Code Mini-Wiki</h1>
+      <p>A simple reference site documenting what code does and how it should be used.</p>
+    </header>
+    <main>
+      <nav>
+        <a href="#overview">Overview</a>
+        <a href="#concepts">Key Concepts</a>
+        <a href="#examples">Examples</a>
+        <a href="#future">Future Notes</a>
+      </nav>
+      <section id="overview">
+        <h2>Overview</h2>
+        <p>This mini-wiki is designed to capture the purpose and behavior of code in a clear, shareable format. It can serve as documentation for developers who need to understand the intent and structure of an implementation.</p>
+      </section>
+      <section id="concepts">
+        <h2>Key Concepts</h2>
+        <p>Use this page to list the most important ideas behind the codebase.</p>
+        <ul>
+          <li><strong>Function roles:</strong> Describe what each function is responsible for.</li>
+          <li><strong>Data flow:</strong> Explain inputs, processing, and outputs.</li>
+          <li><strong>State and side effects:</strong> Note when code changes state or interacts with external systems.</li>
+          <li><strong>Dependencies:</strong> Document libraries, APIs, and modules the code relies on.</li>
+        </ul>
+      </section>
+      <section id="examples">
+        <h2>Examples</h2>
+        <p>Include usage samples and code snippets for typical tasks.</p>
+        <pre><code>// Example: initialize a feature
+function initializeFeature(config) {
+  // validate config
+  // set defaults
+  // start main process
+}
+</code></pre>
+      </section>
+      <section id="future">
+        <h2>Future Notes</h2>
+        <p>Use this area to track planned improvements and documentation needs.</p>
+        <ul>
+          <li>Expand documentation for each module.</li>
+          <li>Add visual diagrams for data flow and architecture.</li>
+          <li>Keep examples up to date with implementation changes.</li>
+        </ul>
+      </section>
+    </main>
+  </body>
+</html>
