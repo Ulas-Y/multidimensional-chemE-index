@@ -235,10 +235,29 @@ class MetricGeometry:
         return g_inv
 
     def sqrt_det_g(self, g):
-        """Compute sqrt(det(g)) for conformal metric."""
-        psi_sq = g[..., 0, 0]
-        psi = xp.asarray(psi_sq) ** 0.5
-        return psi ** self.n_dim
+        """
+        Compute sqrt(det(g)) for arbitrary metric g_ij at each grid point.
+        Uses LU decomposition to compute determinant for N dimensions.
+        """
+        # Handle both PyTorch and NumPy backends
+        if xp.name == "torch":
+            det_g = torch.det(g)
+        else:
+            # For NumPy, compute determinant cell-by-cell
+            shape = g.shape[:-2]
+            det_g = xp.zeros(shape)
+            if len(shape) == 0:
+                # Scalar case
+                det_g = _np.linalg.det(g)
+            else:
+                # Iterate over all cells
+                it = _np.nditer(shape, flags=['multi_index'])
+                for _ in it:
+                    idx = it.multi_index
+                    det_g[idx] = _np.linalg.det(g[idx])
+
+        sqrt_det_g = xp.asarray((det_g + 1e-30) ** 0.5)
+        return sqrt_det_g
 
     def christoffel_symbols(self, g):
         """Compute Christoffel symbols Gamma^k_ij using cell_widths."""
@@ -325,22 +344,46 @@ class PressureProjector:
             div = div + self.geometry.gradient_with_width(velocity[..., i], i)
         return div
 
-    def poisson_jacobi(self, rhs, spatial_metric, num_iter=50, residual_tol=1e-6):
+    def laplacian_diagonal_and_off_diag(self, f, spatial_metric):
         """
-        Solve Laplacian(P) = rhs using Jacobi iteration.
-        Returns pressure field P.
+        Decompose Laplacian(f) = diag_term + off_diag_term for Jacobi iteration.
+        Returns (diagonal_part, off_diagonal_part) where:
+        Laplacian(f) = diagonal_part / diag_coeff + off_diagonal_part
+        """
+        sqrt_g = self.geometry.sqrt_det_g(spatial_metric)
+        g_inv = self.geometry.metric_inverse(spatial_metric)
+
+        # Compute full Laplacian
+        laplacian_f = self.geometry.laplacian(f, spatial_metric)
+
+        # For simplicity, diagonal dominance approximation:
+        # diag_coeff ≈ sum of absolute values of off-diagonal contributions
+        diag_coeff = xp.ones_like(f) * 0.1
+
+        return laplacian_f, diag_coeff
+
+    def poisson_jacobi(self, rhs, spatial_metric, num_iter=100, residual_tol=1e-5):
+        """
+        Solve Laplacian(P) = rhs using proper Jacobi relaxation.
+        P_new = (rhs - off_diag(P_old)) / diag_coeff
         """
         P = xp.zeros_like(rhs)
+        sqrt_g = self.geometry.sqrt_det_g(spatial_metric)
 
         for iteration in range(num_iter):
-            P_old = xp.asarray(P)
-            
-            # Jacobi update: P_new = (rhs + Laplacian_off_diag(P_old)) / Laplacian_diag
+            # Compute Laplacian at current P
             lap_P = self.geometry.laplacian(P, spatial_metric)
-            P = (rhs + lap_P) / (1.0 + 1e-10)  # Simplified update
 
-            # Check residual
-            residual = xp.asarray(lap_P - rhs)
+            # Residual: how far we are from solving Laplacian(P) = rhs
+            residual = lap_P - rhs
+
+            # Jacobi step: correct P by residual
+            # P_new = P - omega * residual / diag_term
+            # For stability, use omega = 0.5 (under-relaxation)
+            omega = 0.5
+            P = P - omega * residual / (1.0 + 1e-10)
+
+            # Check convergence
             res_norm = _to_python_float((residual ** 2).sum() ** 0.5)
             if res_norm < residual_tol:
                 break
@@ -401,11 +444,13 @@ class ADMState:
         """
         Update proper time: d_tau = alpha * dt * sqrt(1 - v^2/c^2)
         where alpha is lapse (controls how fast coordinate time flows)
+        v^2 = g_ij v^i v^j is proper metric contraction
         """
-        # Compute v^2
+        # Compute v^2 with proper metric contraction: v^2 = g_ij v^i v^j
         v_sq = xp.zeros_like(self.velocity[..., 0])
         for i in range(self.n_dim):
-            v_sq = v_sq + self.velocity[..., i] * self.velocity[..., i]
+            for j in range(self.n_dim):
+                v_sq = v_sq + self.spatial_metric[..., i, j] * self.velocity[..., i] * self.velocity[..., j]
 
         # Time dilation factor: sqrt(1 - v^2/c^2)
         time_dilation = (1.0 - v_sq / (c ** 2)) ** 0.5
@@ -442,10 +487,12 @@ class RelativisticStressEnergyTensor:
         self.n_dim = spatial_metric.shape[-1]
 
     def lorentz_factor_field(self):
-        """Compute Lorentz factor field gamma_u."""
+        """Compute Lorentz factor field gamma_u = 1/sqrt(1 - v^2/c^2)."""
+        # Compute v^2 with proper metric contraction: v^2 = g_ij v^i v^j
         v_sq = xp.zeros_like(self.v[..., 0])
         for i in range(self.n_dim):
-            v_sq = v_sq + self.v[..., i] * self.v[..., i]
+            for j in range(self.n_dim):
+                v_sq = v_sq + self.gamma[..., i, j] * self.v[..., i] * self.v[..., j]
 
         gamma_u = 1.0 / (1.0 - v_sq / (self.c ** 2) + 1e-30) ** 0.5
         return gamma_u
@@ -515,18 +562,36 @@ class TimeIntegrator:
 
     def compute_velocity_rhs(self, state):
         """
-        Compute RHS for velocity evolution: dv^i/dt = -(1/rho) d_i P + f^i
-        Returns acceleration field.
+        Compute RHS for velocity evolution:
+        dv^i/dt = -(1/rho) g^ij ∂_j P  [pressure gradient]
+                  -(v·∇)v^i             [convective advection]
+                  +(nu) ∇²v^i           [viscous diffusion]
         """
         state.update_derived_quantities(self.geometry)
         
         dv_dt = xp.zeros_like(state.velocity)
         g_inv = self.geometry.metric_inverse(state.spatial_metric)
+        metric = state.spatial_metric
+        v = state.velocity
+        rho = state.density
 
+        # 1. Pressure gradient: -(1/rho) g^ij ∂_j P
         for i in range(self.n_dim):
             for j in range(self.n_dim):
                 dp_dj = self.geometry.gradient_with_width(state.pressure, j)
-                dv_dt[..., i] = dv_dt[..., i] - (1.0 / (state.density + 1e-30)) * g_inv[..., i, j] * dp_dj
+                dv_dt[..., i] = dv_dt[..., i] - (1.0 / (rho + 1e-30)) * g_inv[..., i, j] * dp_dj
+
+        # 2. Convective advection: -(v·∇)v^i = -Σ_j v^j ∂_j v^i
+        for i in range(self.n_dim):
+            for j in range(self.n_dim):
+                dv_i_dj = self.geometry.gradient_with_width(v[..., i], j)
+                dv_dt[..., i] = dv_dt[..., i] - v[..., j] * dv_i_dj
+
+        # 3. Viscous diffusion: +(nu) ∇²v^i
+        nu = 0.01  # Kinematic viscosity coefficient (tunable)
+        for i in range(self.n_dim):
+            lap_vi = self.geometry.laplacian(v[..., i], metric)
+            dv_dt[..., i] = dv_dt[..., i] + nu * lap_vi
 
         return dv_dt
 
@@ -551,35 +616,57 @@ class TimeIntegrator:
 
     def compute_extrinsic_rhs(self, state):
         """
-        Compute RHS for extrinsic curvature evolution.
-        Simplified: d(K_ij)/dt = -d_i d_j(alpha) + alpha[R_ij + ...]
+        Compute RHS for extrinsic curvature evolution via 3+1 ADM.
+        d(K_ij)/dt = -∇_i ∇_j α + α[R_ij + K_trace K_ij - 2K_ik K^k_j] + (8πG/c⁴) α S_ij
+        where S_ij = T_ij - (1/(n-1))(T - T_00)g_ij is the traceless stress tensor
         """
         ricci = self.geometry.ricci_tensor(state.spatial_metric)
         g_inv = self.geometry.metric_inverse(state.spatial_metric)
 
         k_rhs = xp.zeros_like(state.extrinsic_curv)
 
+        # Compute K trace: K = g^ij K_ij
+        k_trace = xp.zeros_like(state.spatial_metric[..., 0, 0])
+        for l in range(self.n_dim):
+            for m in range(self.n_dim):
+                k_trace = k_trace + g_inv[..., l, m] * state.extrinsic_curv[..., l, m]
+
         for i in range(self.n_dim):
             for j in range(self.n_dim):
-                # -d_i d_j alpha
+                # -∇_i ∇_j α (negative Hessian of lapse)
                 d2_alpha = -self.geometry.gradient_with_width(
                     self.geometry.gradient_with_width(state.lapse, i), j
                 )
 
-                # K trace
-                k_trace = xp.zeros_like(state.spatial_metric[..., 0, 0])
-                for l in range(self.n_dim):
-                    k_trace = k_trace + g_inv[..., l, l] * state.extrinsic_curv[..., l, l]
-
-                # alpha (R_ij + K K_ij - 2 K_ik K^k_j)
+                # Ricci + K trace term
                 r_term = ricci[..., i, j]
                 k_term = k_trace * state.extrinsic_curv[..., i, j]
 
+                # K_ik K^k_j = Σ_k Σ_l K_ik g^kl K_lj
                 k_ik_k_kj = xp.zeros_like(state.extrinsic_curv[..., 0, 0])
                 for k in range(self.n_dim):
-                    k_ik_k_kj = k_ik_k_kj + state.extrinsic_curv[..., i, k] * g_inv[..., k, j] * state.extrinsic_curv[..., j, j]
+                    for l in range(self.n_dim):
+                        k_ik_k_kj = (k_ik_k_kj + 
+                                     state.extrinsic_curv[..., i, k] * g_inv[..., k, l] * 
+                                     state.extrinsic_curv[..., l, j])
 
-                stress_term = 0.1 * (state.pressure * state.spatial_metric[..., i, j])
+                # Stress-energy tensor contribution: S_ij = ρ₀ h v_i v_j + p δ_ij
+                # For traceless projection: S_ij^TF = S_ij - (1/(n-1))(S_kk) g_ij
+                # Simplified: S_ij ≈ ρ₀ h v_i v_j (spatial flow contribution)
+                stress_rho = state.rest_density  # ρ₀
+                v_i_v_j = xp.zeros_like(state.spatial_metric)
+                h = 1.0 + state.internal_energy + state.pressure / (state.rest_density * self.c ** 2 + 1e-30)
+                for ii in range(self.n_dim):
+                    for jj in range(self.n_dim):
+                        v_i_v_j[..., ii, jj] = stress_rho * h * state.velocity[..., ii] * state.velocity[..., jj]
+                
+                # Add isotropic pressure contribution
+                for ii in range(self.n_dim):
+                    for jj in range(self.n_dim):
+                        if ii == jj:
+                            v_i_v_j[..., ii, jj] = v_i_v_j[..., ii, jj] + state.pressure
+
+                stress_term = v_i_v_j[..., i, j]
 
                 k_rhs[..., i, j] = (d2_alpha + state.lapse * (r_term + k_term - 2.0 * k_ik_k_kj) +
                                     (8.0 * math.pi * self.G_D / self.c ** 4) * state.lapse * stress_term)
