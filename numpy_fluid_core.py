@@ -192,11 +192,22 @@ class MetricGeometry:
         n_dim : int
             Number of spatial dimensions
         cell_widths : array-like, optional
-            Cell widths for each dimension. If None, uses uniform spacing.
+            Cell widths for each dimension. If None, uses uniform spacing of 1.0.
         """
         self.n_dim = n_dim
-        self.cell_widths = cell_widths if cell_widths is not None else _np.ones(n_dim)
+        if cell_widths is None:
+            self.cell_widths = _np.ones(n_dim)
+        else:
+            self.cell_widths = _np.asarray(cell_widths)
         self.omega_n_minus_1 = omega_n_minus_1(n_dim - 1) if n_dim > 1 else 1.0
+
+    def gradient_with_width(self, f, axis):
+        """
+        Compute gradient respecting cell widths: df/dx = gradient(f) / cell_width[axis]
+        """
+        grad = xp.gradient(f, axis=axis)
+        width = float(self.cell_widths[axis])
+        return grad / width
 
     def conformal_factor_from_potential(self, potential, c=299792458.0):
         """Compute conformal factor psi = 1 + Phi / c^2."""
@@ -205,16 +216,6 @@ class MetricGeometry:
     def metric_from_conformal(self, psi):
         """
         Compute spatial metric g_ij = psi^2 * delta_ij.
-        
-        Parameters
-        ----------
-        psi : array
-            Conformal factor at each cell
-            
-        Returns
-        -------
-        g : array of shape (..., n_dim, n_dim)
-            Spatial metric tensor
         """
         shape = psi.shape + (self.n_dim, self.n_dim)
         g = xp.zeros(shape)
@@ -225,10 +226,7 @@ class MetricGeometry:
         return g
 
     def metric_inverse(self, g):
-        """
-        Compute inverse metric g^ij from g_ij.
-        For conformal metric: g^ij = psi^{-2} * delta_ij
-        """
+        """Compute inverse metric g^ij from g_ij."""
         g_inv = xp.zeros_like(g)
         for i in range(self.n_dim):
             for j in range(self.n_dim):
@@ -243,9 +241,7 @@ class MetricGeometry:
         return psi ** self.n_dim
 
     def christoffel_symbols(self, g):
-        """
-        Compute Christoffel symbols Gamma^k_ij.
-        """
+        """Compute Christoffel symbols Gamma^k_ij using cell_widths."""
         gamma = xp.zeros(g.shape[:-2] + (self.n_dim, self.n_dim, self.n_dim))
         g_inv = self.metric_inverse(g)
 
@@ -254,9 +250,9 @@ class MetricGeometry:
                 for j in range(self.n_dim):
                     term = xp.zeros_like(g[..., 0, 0])
                     for l in range(self.n_dim):
-                        dg_i = xp.gradient(g[..., l, j], axis=i)
-                        dg_j = xp.gradient(g[..., l, i], axis=j)
-                        dg_l = xp.gradient(g[..., i, j], axis=l)
+                        dg_i = self.gradient_with_width(g[..., l, j], i)
+                        dg_j = self.gradient_with_width(g[..., l, i], j)
+                        dg_l = self.gradient_with_width(g[..., i, j], l)
                         term = term + g_inv[..., k, l] * (dg_i + dg_j - dg_l)
 
                     gamma[..., k, i, j] = 0.5 * term
@@ -274,8 +270,8 @@ class MetricGeometry:
                 term = xp.zeros_like(g[..., 0, 0])
 
                 for k in range(self.n_dim):
-                    term = term + xp.gradient(gamma[..., k, i, j], axis=k)
-                    term = term - xp.gradient(gamma[..., k, k, i], axis=j)
+                    term = term + self.gradient_with_width(gamma[..., k, i, j], k)
+                    term = term - self.gradient_with_width(gamma[..., k, k, i], j)
 
                     for l in range(self.n_dim):
                         term = term + gamma[..., k, i, j] * gamma[..., l, k, l]
@@ -298,7 +294,7 @@ class MetricGeometry:
         return r_scalar
 
     def laplacian(self, f, g):
-        """Compute Laplacian in metric g: L f = (1/sqrt(g)) d_i (sqrt(g) g^ij d_j f)."""
+        """Compute Laplacian in metric g respecting cell_widths."""
         sqrt_g = self.sqrt_det_g(g)
         g_inv = self.metric_inverse(g)
         laplacian = xp.zeros_like(f)
@@ -306,11 +302,75 @@ class MetricGeometry:
         for i in range(self.n_dim):
             flux = xp.zeros_like(f)
             for j in range(self.n_dim):
-                flux = flux + sqrt_g * g_inv[..., i, j] * xp.gradient(f, axis=j)
-            laplacian = laplacian + xp.gradient(flux, axis=i)
+                flux = flux + sqrt_g * g_inv[..., i, j] * self.gradient_with_width(f, j)
+            laplacian = laplacian + self.gradient_with_width(flux, i)
 
         laplacian = laplacian / (sqrt_g + 1e-30)
         return laplacian
+
+
+# ============================================================================
+# Pressure Projection
+# ============================================================================
+
+class PressureProjector:
+    """Pressure Poisson solver and velocity projection for incompressibility."""
+    def __init__(self, geometry):
+        self.geometry = geometry
+
+    def divergence(self, velocity):
+        """Compute divergence of velocity field."""
+        div = xp.zeros_like(velocity[..., 0])
+        for i in range(self.geometry.n_dim):
+            div = div + self.geometry.gradient_with_width(velocity[..., i], i)
+        return div
+
+    def poisson_jacobi(self, rhs, spatial_metric, num_iter=50, residual_tol=1e-6):
+        """
+        Solve Laplacian(P) = rhs using Jacobi iteration.
+        Returns pressure field P.
+        """
+        P = xp.zeros_like(rhs)
+
+        for iteration in range(num_iter):
+            P_old = xp.asarray(P)
+            
+            # Jacobi update: P_new = (rhs + Laplacian_off_diag(P_old)) / Laplacian_diag
+            lap_P = self.geometry.laplacian(P, spatial_metric)
+            P = (rhs + lap_P) / (1.0 + 1e-10)  # Simplified update
+
+            # Check residual
+            residual = xp.asarray(lap_P - rhs)
+            res_norm = _to_python_float((residual ** 2).sum() ** 0.5)
+            if res_norm < residual_tol:
+                break
+
+        return P
+
+    def project_velocity(self, velocity, spatial_metric, dt, density):
+        """
+        Enforce incompressibility via projection:
+        v_new = v - (dt / rho) g^ij d_j P
+        where P solves: Laplacian(P) = (rho / dt) div(v)
+        """
+        # Compute divergence
+        div_v = self.divergence(velocity)
+
+        # Solve Poisson: Laplacian(P) = (rho / dt) div(v)
+        rhs = (density / (dt + 1e-30)) * div_v
+        pressure = self.poisson_jacobi(rhs, spatial_metric)
+
+        # Project velocity
+        v_proj = xp.zeros_like(velocity)
+        g_inv = self.geometry.metric_inverse(spatial_metric)
+
+        for i in range(self.geometry.n_dim):
+            v_proj[..., i] = velocity[..., i]
+            for j in range(self.geometry.n_dim):
+                dp_dj = self.geometry.gradient_with_width(pressure, j)
+                v_proj[..., i] = v_proj[..., i] - (dt / (density + 1e-30)) * g_inv[..., i, j] * dp_dj
+
+        return v_proj, pressure
 
 
 # ============================================================================
@@ -337,7 +397,27 @@ class ADMState:
         self.proper_time = xp.zeros_like(mass)
         self.coordinate_time = 0.0
 
-    def update_derived_quantities(self, geometry, c=299792458.0):
+    def update_proper_time(self, geometry, dt, c=299792458.0):
+        """
+        Update proper time: d_tau = alpha * dt * sqrt(1 - v^2/c^2)
+        where alpha is lapse (controls how fast coordinate time flows)
+        """
+        # Compute v^2
+        v_sq = xp.zeros_like(self.velocity[..., 0])
+        for i in range(self.n_dim):
+            v_sq = v_sq + self.velocity[..., i] * self.velocity[..., i]
+
+        # Time dilation factor: sqrt(1 - v^2/c^2)
+        time_dilation = (1.0 - v_sq / (c ** 2)) ** 0.5
+        time_dilation = xp.asarray(time_dilation)
+
+        # Proper time increment: d_tau = alpha * dt * sqrt(1 - v^2/c^2)
+        d_tau = self.lapse * dt * time_dilation
+
+        self.proper_time = self.proper_time + d_tau
+        self.coordinate_time = self.coordinate_time + dt
+
+    def update_derived_quantities(self, geometry):
         """Compute derived quantities from primary fields."""
         sqrt_g = geometry.sqrt_det_g(self.spatial_metric)
         self.local_volume = sqrt_g
@@ -424,91 +504,198 @@ class ConstraintChecker:
 # Time Integrators
 # ============================================================================
 
-class ExplicitEulerIntegrator:
-    """Explicit Euler time integrator."""
+class TimeIntegrator:
+    """Base class for time integrators."""
     def __init__(self, geometry, n_dim, c=299792458.0, G_D=6.67430e-11):
         self.geometry = geometry
         self.n_dim = n_dim
         self.c = c
         self.G_D = G_D
+        self.projector = PressureProjector(geometry)
 
-    def step(self, state, dt):
-        """Advance state by dt using explicit Euler."""
-        ricci = self.geometry.ricci_tensor(state.spatial_metric)
-        ricci_scalar = self.geometry.ricci_scalar(state.spatial_metric)
+    def compute_velocity_rhs(self, state):
+        """
+        Compute RHS for velocity evolution: dv^i/dt = -(1/rho) d_i P + f^i
+        Returns acceleration field.
+        """
+        state.update_derived_quantities(self.geometry)
+        
+        dv_dt = xp.zeros_like(state.velocity)
         g_inv = self.geometry.metric_inverse(state.spatial_metric)
-        sqrt_g = self.geometry.sqrt_det_g(state.spatial_metric)
 
-        ten = RelativisticStressEnergyTensor(
-            state.rest_density, state.velocity, state.internal_energy,
-            state.pressure, state.spatial_metric, c=self.c
-        )
-        energy_dens = ten.energy_density()
-
-        k_trace = xp.zeros_like(state.spatial_metric[..., 0, 0])
         for i in range(self.n_dim):
             for j in range(self.n_dim):
-                k_trace = k_trace + g_inv[..., i, j] * state.extrinsic_curv[..., i, j]
+                dp_dj = self.geometry.gradient_with_width(state.pressure, j)
+                dv_dt[..., i] = dv_dt[..., i] - (1.0 / (state.density + 1e-30)) * g_inv[..., i, j] * dp_dj
 
-        # Update metric
-        metric_new = xp.zeros_like(state.spatial_metric)
+        return dv_dt
+
+    def compute_mass_rhs(self, state):
+        """
+        Compute RHS for mass evolution: dm/dt = -m * div(v)
+        """
+        div_v = self.projector.divergence(state.velocity)
+        dm_dt = -state.mass * div_v
+        return dm_dt
+
+    def compute_metric_rhs(self, state):
+        """
+        Compute RHS for metric evolution: d(gamma_ij)/dt = -2*alpha*K_ij + ...
+        """
+        metric_rhs = xp.zeros_like(state.spatial_metric)
         for i in range(self.n_dim):
             for j in range(self.n_dim):
-                metric_new[..., i, j] = (state.spatial_metric[..., i, j] -
-                                         2.0 * state.lapse * state.extrinsic_curv[..., i, j] * dt)
+                metric_rhs[..., i, j] = -2.0 * state.lapse * state.extrinsic_curv[..., i, j]
 
-        # Update extrinsic curvature
-        k_new = xp.zeros_like(state.extrinsic_curv)
+        return metric_rhs
+
+    def compute_extrinsic_rhs(self, state):
+        """
+        Compute RHS for extrinsic curvature evolution.
+        Simplified: d(K_ij)/dt = -d_i d_j(alpha) + alpha[R_ij + ...]
+        """
+        ricci = self.geometry.ricci_tensor(state.spatial_metric)
+        g_inv = self.geometry.metric_inverse(state.spatial_metric)
+
+        k_rhs = xp.zeros_like(state.extrinsic_curv)
+
         for i in range(self.n_dim):
             for j in range(self.n_dim):
-                d2_alpha_ij = -xp.gradient(xp.gradient(state.lapse, axis=i), axis=j)
+                # -d_i d_j alpha
+                d2_alpha = -self.geometry.gradient_with_width(
+                    self.geometry.gradient_with_width(state.lapse, i), j
+                )
+
+                # K trace
+                k_trace = xp.zeros_like(state.spatial_metric[..., 0, 0])
+                for l in range(self.n_dim):
+                    k_trace = k_trace + g_inv[..., l, l] * state.extrinsic_curv[..., l, l]
+
+                # alpha (R_ij + K K_ij - 2 K_ik K^k_j)
                 r_term = ricci[..., i, j]
                 k_term = k_trace * state.extrinsic_curv[..., i, j]
 
-                stress_term = 0.1 * (energy_dens * state.spatial_metric[..., i, j])
+                k_ik_k_kj = xp.zeros_like(state.extrinsic_curv[..., 0, 0])
+                for k in range(self.n_dim):
+                    k_ik_k_kj = k_ik_k_kj + state.extrinsic_curv[..., i, k] * g_inv[..., k, j] * state.extrinsic_curv[..., j, j]
 
-                k_new[..., i, j] = (state.extrinsic_curv[..., i, j] +
-                                    dt * (d2_alpha_ij + state.lapse * (r_term + k_term) +
-                                          (8.0 * math.pi * self.G_D / self.c ** 4) * state.lapse * stress_term))
+                stress_term = 0.1 * (state.pressure * state.spatial_metric[..., i, j])
 
-        # Update mass
-        div_v = xp.zeros_like(state.velocity[..., 0])
-        for i in range(self.n_dim):
-            div_v = div_v + xp.gradient(state.velocity[..., i], axis=i)
+                k_rhs[..., i, j] = (d2_alpha + state.lapse * (r_term + k_term - 2.0 * k_ik_k_kj) +
+                                    (8.0 * math.pi * self.G_D / self.c ** 4) * state.lapse * stress_term)
 
-        mass_new = state.mass - dt * state.mass * div_v
+        return k_rhs
 
-        # Update velocity
-        vel_new = xp.asarray(state.velocity)
+    def copy_state(self, state):
+        """Create a deep copy of state."""
+        new_state = ADMState(
+            state.n_dim, xp.asarray(state.lapse), xp.asarray(state.shift),
+            xp.asarray(state.spatial_metric), xp.asarray(state.extrinsic_curv),
+            xp.asarray(state.mass), xp.asarray(state.velocity),
+            xp.asarray(state.pressure), xp.asarray(state.rest_density),
+            xp.asarray(state.internal_energy)
+        )
+        new_state.proper_time = xp.asarray(state.proper_time)
+        new_state.coordinate_time = state.coordinate_time
+        return new_state
+
+    def add_scaled_rhs(self, state, rhs_velocity, rhs_mass, rhs_metric, rhs_extrinsic, factor):
+        """Add scaled RHS to state: state += factor * rhs"""
+        new_state = self.copy_state(state)
+        new_state.velocity = state.velocity + factor * rhs_velocity
+        new_state.mass = state.mass + factor * rhs_mass
+        new_state.spatial_metric = state.spatial_metric + factor * rhs_metric
+        new_state.extrinsic_curv = state.extrinsic_curv + factor * rhs_extrinsic
+        return new_state
+
+
+class ExplicitEulerIntegrator(TimeIntegrator):
+    """Explicit Euler time integrator: x^{n+1} = x^n + dt * dx/dt"""
+    def step(self, state, dt):
+        """Advance state by dt using explicit Euler."""
+        # Compute RHS at current state
+        vel_rhs = self.compute_velocity_rhs(state)
+        mass_rhs = self.compute_mass_rhs(state)
+        metric_rhs = self.compute_metric_rhs(state)
+        extrinsic_rhs = self.compute_extrinsic_rhs(state)
+
+        # Update state
+        state_new = self.copy_state(state)
+        state_new.velocity = state.velocity + dt * vel_rhs
+        state_new.mass = state.mass + dt * mass_rhs
+        state_new.spatial_metric = state.spatial_metric + dt * metric_rhs
+        state_new.extrinsic_curv = state.extrinsic_curv + dt * extrinsic_rhs
+
+        # Project velocity to enforce incompressibility
+        state_new.update_derived_quantities(self.geometry)
+        state_new.velocity, state_new.pressure = self.projector.project_velocity(
+            state_new.velocity, state_new.spatial_metric, dt, state_new.density
+        )
 
         # Update proper time
-        proper_time_new = state.proper_time + dt
-
-        state_new = ADMState(self.n_dim, state.lapse, state.shift, metric_new,
-                             k_new, mass_new, vel_new, state.pressure,
-                             state.rest_density, state.internal_energy)
-        state_new.proper_time = proper_time_new
-        state_new.coordinate_time = state.coordinate_time + dt
+        state_new.update_proper_time(self.geometry, dt, self.c)
 
         return state_new
 
 
-class RK4Integrator:
-    """4th-order Runge-Kutta time integrator."""
-    def __init__(self, geometry, n_dim, c=299792458.0, G_D=6.67430e-11):
-        self.geometry = geometry
-        self.n_dim = n_dim
-        self.c = c
-        self.G_D = G_D
-        self.euler = ExplicitEulerIntegrator(geometry, n_dim, c, G_D)
-
+class RK4Integrator(TimeIntegrator):
+    """
+    4th-order Runge-Kutta integrator.
+    x^{n+1} = x^n + (dt/6) * (k1 + 2*k2 + 2*k3 + k4)
+    """
     def step(self, state, dt):
-        """RK4 step with proper substages."""
-        k1 = self.euler.step(state, dt / 6.0)
-        k2 = self.euler.step(k1, dt / 3.0)
-        k3 = self.euler.step(k2, dt / 3.0)
-        k4 = self.euler.step(k3, dt / 6.0)
-        return k4
+        """Advance state by dt using RK4."""
+        # Stage 1: k1 = f(t, x^n)
+        k1_vel = self.compute_velocity_rhs(state)
+        k1_mass = self.compute_mass_rhs(state)
+        k1_metric = self.compute_metric_rhs(state)
+        k1_extrinsic = self.compute_extrinsic_rhs(state)
+
+        # Stage 2: k2 = f(t + dt/2, x^n + (dt/2)*k1)
+        state_2 = self.add_scaled_rhs(state, k1_vel, k1_mass, k1_metric, k1_extrinsic, dt / 2.0)
+        state_2.update_derived_quantities(self.geometry)
+        k2_vel = self.compute_velocity_rhs(state_2)
+        k2_mass = self.compute_mass_rhs(state_2)
+        k2_metric = self.compute_metric_rhs(state_2)
+        k2_extrinsic = self.compute_extrinsic_rhs(state_2)
+
+        # Stage 3: k3 = f(t + dt/2, x^n + (dt/2)*k2)
+        state_3 = self.add_scaled_rhs(state, k2_vel, k2_mass, k2_metric, k2_extrinsic, dt / 2.0)
+        state_3.update_derived_quantities(self.geometry)
+        k3_vel = self.compute_velocity_rhs(state_3)
+        k3_mass = self.compute_mass_rhs(state_3)
+        k3_metric = self.compute_metric_rhs(state_3)
+        k3_extrinsic = self.compute_extrinsic_rhs(state_3)
+
+        # Stage 4: k4 = f(t + dt, x^n + dt*k3)
+        state_4 = self.add_scaled_rhs(state, k3_vel, k3_mass, k3_metric, k3_extrinsic, dt)
+        state_4.update_derived_quantities(self.geometry)
+        k4_vel = self.compute_velocity_rhs(state_4)
+        k4_mass = self.compute_mass_rhs(state_4)
+        k4_metric = self.compute_metric_rhs(state_4)
+        k4_extrinsic = self.compute_extrinsic_rhs(state_4)
+
+        # Combine stages
+        state_new = self.copy_state(state)
+        state_new.velocity = (state.velocity + 
+                             (dt / 6.0) * (k1_vel + 2.0*k2_vel + 2.0*k3_vel + k4_vel))
+        state_new.mass = (state.mass + 
+                         (dt / 6.0) * (k1_mass + 2.0*k2_mass + 2.0*k3_mass + k4_mass))
+        state_new.spatial_metric = (state.spatial_metric + 
+                                   (dt / 6.0) * (k1_metric + 2.0*k2_metric + 2.0*k3_metric + k4_metric))
+        state_new.extrinsic_curv = (state.extrinsic_curv + 
+                                   (dt / 6.0) * (k1_extrinsic + 2.0*k2_extrinsic + 2.0*k3_extrinsic + k4_extrinsic))
+
+        # Project velocity to enforce incompressibility
+        state_new.update_derived_quantities(self.geometry)
+        state_new.velocity, state_new.pressure = self.projector.project_velocity(
+            state_new.velocity, state_new.spatial_metric, dt, state_new.density
+        )
+
+        # Update proper time
+        state_new.update_proper_time(self.geometry, dt, self.c)
+
+        return state_new
 
 
 # ============================================================================
@@ -519,8 +706,41 @@ class RelativisticFluidSimulation:
     """Main simulation loop."""
     def __init__(self, n_dim, lapse, shift, spatial_metric, extrinsic_curv,
                  mass, velocity, pressure, rest_density, internal_energy,
-                 cell_widths=None, c=299792458.0, G_D=6.67430e-11):
-        """Initialize simulation."""
+                 cell_widths=None, integrator_type='euler', c=299792458.0, G_D=6.67430e-11):
+        """
+        Initialize simulation.
+        
+        Parameters
+        ----------
+        n_dim : int
+            Spatial dimensions
+        lapse : array
+            Lapse function alpha
+        shift : array of shape (..., n_dim)
+            Shift vector beta^i
+        spatial_metric : array of shape (..., n_dim, n_dim)
+            Spatial metric gamma_ij
+        extrinsic_curv : array of shape (..., n_dim, n_dim)
+            Extrinsic curvature K_ij
+        mass : array
+            Rest mass in each cell
+        velocity : array of shape (..., n_dim)
+            3-velocity v^i
+        pressure : array
+            Pressure field p
+        rest_density : array
+            Rest mass density rho_0
+        internal_energy : array
+            Specific internal energy epsilon
+        cell_widths : array, optional
+            Cell widths per dimension
+        integrator_type : str
+            'euler' for Explicit Euler, 'rk4' for RK4
+        c : float
+            Speed of light
+        G_D : float
+            Gravitational constant
+        """
         self.n_dim = n_dim
         self.c = c
         self.G_D = G_D
@@ -528,7 +748,12 @@ class RelativisticFluidSimulation:
         self.geometry = MetricGeometry(n_dim, cell_widths)
         self.state = ADMState(n_dim, lapse, shift, spatial_metric, extrinsic_curv,
                               mass, velocity, pressure, rest_density, internal_energy)
-        self.integrator = ExplicitEulerIntegrator(self.geometry, n_dim, c, G_D)
+        
+        if integrator_type.lower() == 'rk4':
+            self.integrator = RK4Integrator(self.geometry, n_dim, c, G_D)
+        else:
+            self.integrator = ExplicitEulerIntegrator(self.geometry, n_dim, c, G_D)
+        
         self.constraint_checker = ConstraintChecker(self.geometry, n_dim, c, G_D)
 
     def step(self, dt):
