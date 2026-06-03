@@ -126,6 +126,59 @@ for step in range(num_steps):
           <li><strong>Time integrators:</strong> Supports explicit Euler and RK4 with full primitive-state updates.</li>
         </ul>
       </section>
+      <section id="limitations">
+        <h2>Known Limitations</h2>
+        <ul>
+          <li>CFL stability control is not yet implemented.</li>
+          <li>Pressure projection is not part of the main evolution loop.</li>
+          <li>No adaptive mesh refinement support is available.</li>
+          <li>No verified benchmark suite exists yet.</li>
+          <li>Constraint damping has not been implemented.</li>
+          <li>Mass-density consistency checks are not yet enforced.</li>
+          <li>Arbitrary N-dimensional support has not yet been validated against analytical solutions.</li>
+        </ul>
+      </section>
+      <section id="verification-status">
+        <h2>Verification Status</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Test</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Flat spacetime stability</td>
+              <td>Not tested</td>
+            </tr>
+            <tr>
+              <td>Uniform density equilibrium</td>
+              <td>Not tested</td>
+            </tr>
+            <tr>
+              <td>Relativistic advection</td>
+              <td>Not tested</td>
+            </tr>
+            <tr>
+              <td>Shock tube</td>
+              <td>Not tested</td>
+            </tr>
+            <tr>
+              <td>Constraint preservation</td>
+              <td>Partial</td>
+            </tr>
+            <tr>
+              <td>Mass conservation</td>
+              <td>Partial</td>
+            </tr>
+            <tr>
+              <td>Curved metric evolution</td>
+              <td>Not tested</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
       <section id="future">
         <h2>Future Notes</h2>
         <ul>
