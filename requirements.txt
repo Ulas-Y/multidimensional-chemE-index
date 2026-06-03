@@ -1,0 +1,4 @@
+numpy
+pytest
+# Optional: torch (only if you want GPU runs)
+# torch
