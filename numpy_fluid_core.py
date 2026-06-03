@@ -115,12 +115,28 @@ class _Backend:
         return self.backend.mean(x, axis=axis)
 
 
-if _TORCH_AVAILABLE and torch.cuda.is_available():
-    xp = _Backend(torch, "torch")
-else:
-    if _TORCH_AVAILABLE:
-        warnings.warn("PyTorch is installed but CUDA is unavailable; falling back to NumPy backend.")
-    xp = _Backend(_np, "numpy")
+class XPBackend:
+    """Public backend selector for NumPy/PyTorch compatibility."""
+    @staticmethod
+    def select(preferred=None):
+        if preferred is not None:
+            name = str(preferred).lower()
+            if name == "torch":
+                if not _TORCH_AVAILABLE:
+                    raise RuntimeError("PyTorch is not installed.")
+                return _Backend(torch, "torch")
+            if name == "numpy":
+                return _Backend(_np, "numpy")
+            raise ValueError(f"Unsupported backend: {preferred}")
+
+        if _TORCH_AVAILABLE and torch.cuda.is_available():
+            return _Backend(torch, "torch")
+        if _TORCH_AVAILABLE:
+            warnings.warn("PyTorch is installed but CUDA unavailable; falling back to NumPy backend.")
+        return _Backend(_np, "numpy")
+
+
+xp = XPBackend.select()
 
 
 # ============================================================================

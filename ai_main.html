@@ -71,42 +71,68 @@
     <main>
       <nav>
         <a href="#overview">Overview</a>
-        <a href="#concepts">Key Concepts</a>
-        <a href="#examples">Examples</a>
+        <a href="#current-status">Current Status</a>
+        <a href="#usage">Usage</a>
+        <a href="#key-concepts">Key Concepts</a>
         <a href="#future">Future Notes</a>
       </nav>
       <section id="overview">
         <h2>Overview</h2>
-        <p>This mini-wiki is designed to capture the purpose and behavior of code in a clear, shareable format. It can serve as documentation for developers who need to understand the intent and structure of an implementation.</p>
+        <p>This mini-wiki documents the relativistic fluid solver implemented in <code>numpy_fluid_core.py</code>. The solver targets a compressible 3+1 ADM formulation of general relativistic hydrodynamics and is backend-agnostic through the <code>xp</code> abstraction.</p>
       </section>
-      <section id="concepts">
-        <h2>Key Concepts</h2>
-        <p>Use this page to list the most important ideas behind the codebase.</p>
+      <section id="current-status">
+        <h2>Current Status</h2>
         <ul>
-          <li><strong>Function roles:</strong> Describe what each function is responsible for.</li>
-          <li><strong>Data flow:</strong> Explain inputs, processing, and outputs.</li>
-          <li><strong>State and side effects:</strong> Note when code changes state or interacts with external systems.</li>
-          <li><strong>Dependencies:</strong> Document libraries, APIs, and modules the code relies on.</li>
+          <li>The main solver is in <code>numpy_fluid_core.py</code>.</li>
+          <li><code>xp</code> selects PyTorch with CUDA when available, otherwise NumPy.</li>
+          <li>Compressible GR hydrodynamics is evolved with EOS closure, without active pressure projection in the evolution loop.</li>
+          <li>Metric effects are included through spatial metric contraction, affine connections, and curvature source terms.</li>
+          <li>Time integration supports both explicit Euler and RK4.</li>
         </ul>
       </section>
-      <section id="examples">
-        <h2>Examples</h2>
-        <p>Include usage samples and code snippets for typical tasks.</p>
-        <pre><code>// Example: initialize a feature
-function initializeFeature(config) {
-  // validate config
-  // set defaults
-  // start main process
-}
+      <section id="usage">
+        <h2>Usage</h2>
+        <p>Typical initialization and evolution pattern:</p>
+        <pre><code>from numpy_fluid_core import XPBackend, RelativisticFluidSimulation
+
+xp = XPBackend.select()  # chooses PyTorch+CUDA if available, else NumPy
+
+sim = RelativisticFluidSimulation(
+    n_dim=3,
+    lapse=alpha_field,
+    shift=beta_field,
+    spatial_metric=gamma_field,
+    extrinsic_curv=K_field,
+    mass=mass_field,
+    velocity=velocity_field,
+    pressure=pressure_field,
+    rest_density=rho0_field,
+    internal_energy=epsilon_field,
+    integrator_type='rk4'
+)
+
+for step in range(num_steps):
+    sim.step(dt)
+    diagnostics = sim.check_constraints()
 </code></pre>
+      </section>
+      <section id="key-concepts">
+        <h2>Key Concepts</h2>
+        <ul>
+          <li><strong>Backend Abstraction:</strong> <code>xp</code> wraps array operations to run on NumPy or PyTorch transparently.</li>
+          <li><strong>3+1 ADM Formalism:</strong> The code evolves fluid primitives and geometric fields on a spatial slice with lapse, shift, and metric.</li>
+          <li><strong>Compressible EOS:</strong> Pressure is updated from an ideal-gas equation of state before RHS evaluation.</li>
+          <li><strong>No active velocity projection:</strong> Pressure projection is available as a utility but not applied in the main compressible evolution path.</li>
+          <li><strong>Time integrators:</strong> Supports explicit Euler and RK4 with full primitive-state updates.</li>
+        </ul>
       </section>
       <section id="future">
         <h2>Future Notes</h2>
-        <p>Use this area to track planned improvements and documentation needs.</p>
         <ul>
-          <li>Expand documentation for each module.</li>
-          <li>Add visual diagrams for data flow and architecture.</li>
-          <li>Keep examples up to date with implementation changes.</li>
+          <li>Document the exact backend selection flow and PyTorch device behavior.</li>
+          <li>Add validation tests for relativistic shock and metric-curvature coupling.</li>
+          <li>Expand solver examples with concrete initial conditions.</li>
+          <li>Keep the mini-wiki synchronized with solver changes.</li>
         </ul>
       </section>
     </main>
