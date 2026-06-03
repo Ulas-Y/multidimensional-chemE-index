@@ -243,35 +243,37 @@ class MetricGeometry:
 
     def metric_inverse(self, g):
         """Compute inverse metric g^ij from g_ij."""
-        g_inv = xp.zeros_like(g)
-        for i in range(self.n_dim):
-            for j in range(self.n_dim):
-                if i == j:
-                    g_inv[..., i, j] = 1.0 / (g[..., i, j] + 1e-30)
-        return g_inv
+        # Use backend-native batched matrix inverse when available.
+        eps = 1e-12
+        if xp.name == "torch":
+            try:
+                return torch.linalg.inv(g)
+            except RuntimeError:
+                # Regularize near-singular matrices by adding tiny identity
+                I = torch.eye(self.n_dim, device=g.device, dtype=g.dtype)
+                return torch.linalg.inv(g + eps * I)
+        else:
+            # NumPy: let numpy handle batched inverses; add tiny diagonal regularization on failure
+            try:
+                return _np.linalg.inv(g)
+            except _np.linalg.LinAlgError:
+                reg = g + eps * _np.eye(self.n_dim)
+                return _np.linalg.inv(reg)
 
     def sqrt_det_g(self, g):
         """
         Compute sqrt(det(g)) for arbitrary metric g_ij at each grid point.
         Uses LU decomposition to compute determinant for N dimensions.
         """
-        # Handle both PyTorch and NumPy backends
+        # Handle both PyTorch and NumPy backends using batched determinant
         if xp.name == "torch":
-            det_g = torch.det(g)
+            # torch.linalg.det supports batched matrices
+            det_g = torch.linalg.det(g)
         else:
-            # For NumPy, compute determinant cell-by-cell
-            shape = g.shape[:-2]
-            det_g = xp.zeros(shape)
-            if len(shape) == 0:
-                # Scalar case
-                det_g = _np.linalg.det(g)
-            else:
-                # Iterate over all cells
-                it = _np.nditer(shape, flags=['multi_index'])
-                for _ in it:
-                    idx = it.multi_index
-                    det_g[idx] = _np.linalg.det(g[idx])
+            # NumPy supports batched determinants for shape (..., n, n)
+            det_g = _np.linalg.det(g)
 
+        # Ensure numerical safety and convert to backend array
         sqrt_det_g = xp.asarray((det_g + 1e-30) ** 0.5)
         return sqrt_det_g
 

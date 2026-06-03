@@ -87,6 +87,8 @@
           <li><code>xp</code> selects PyTorch with CUDA when available, otherwise NumPy.</li>
           <li>Compressible GR hydrodynamics is evolved with EOS closure, without active pressure projection in the evolution loop.</li>
           <li>Metric effects are included through spatial metric contraction, affine connections, and curvature source terms.</li>
+          <li><strong>Recent implementation:</strong> Batched metric determinant and inverse now use backend-native linear algebra (NumPy / PyTorch) with small regularization for numerical stability.</li>
+          <li><strong>Next validations:</strong> Add unit tests for metric operations and small hydro benchmarks (uniform equilibrium, advection).</li>
           <li>Time integration supports both explicit Euler and RK4.</li>
         </ul>
       </section>
